@@ -1964,7 +1964,11 @@ use super::common::SAFE_HCOM_COMMANDS;
 /// Single source of truth — all hook properties derived from this.
 const CLAUDE_HOOK_CONFIGS: &[(&str, &str, &str, Option<u64>)] = &[
     ("SessionStart", "", "sessionstart", None),
-    ("UserPromptSubmit", "", "userpromptsubmit", None),
+    // Finite timeout (unlike the other input-path hooks): this hook shells out to
+    // hcom, which writes the same SQLite DB the delivery thread writes. Without a
+    // timeout, DB contention (esp. on Windows with many active instances) can wedge
+    // the hook and Claude waits forever before inference. 10s > 5s busy_timeout.
+    ("UserPromptSubmit", "", "userpromptsubmit", Some(10)),
     ("PreToolUse", "Bash|Task|Write|Edit", "pre", None),
     ("PostToolUse", "", "post", Some(86400)),
     ("Stop", "", "poll", Some(86400)),
