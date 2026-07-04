@@ -11,11 +11,36 @@
 
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Diagnostic progress counters for the reader producer→consumer pipeline.
+///
+/// Instrumentation only — used to pinpoint the intermittent Windows PTY hang
+/// ("thinking spinner, no output"). Enabled at runtime by `HCOM_PTY_WATCHDOG=1`
+/// (which starts the watchdog thread); the counter increments themselves are
+/// always compiled in but are just relaxed atomic adds, so the overhead is
+/// negligible even when the watchdog is off.
+///
+/// The four counters localise a stall to exactly one stage:
+/// - producer blocked in `reader.read()`  → `bytes_read` stops (idle child; benign).
+/// - producer blocked in `tx.send()`      → `chunks_sent` stops while `bytes_read` moved (channel full → consumer lagging).
+/// - consumer blocked in `stdout` write   → `bytes_written` stops while `chunks_recv` moved (the #1 suspect).
+/// - consumer not scheduled at all        → `chunks_recv` stops while `chunks_sent` moved.
+#[derive(Default)]
+pub struct PtyProgress {
+    /// Bytes the producer has read from the ConPTY (incremented after each `read`).
+    pub bytes_read: AtomicU64,
+    /// Chunks the producer has successfully pushed onto the channel (after `tx.send` returns Ok).
+    pub chunks_sent: AtomicU64,
+    /// Chunks the consumer has pulled off the channel (after `rx.recv_timeout` returns Ok).
+    pub chunks_recv: AtomicU64,
+    /// Bytes the consumer has flushed to stdout (after `stdout.flush` returns).
+    pub bytes_written: AtomicU64,
+}
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -86,6 +111,9 @@ pub struct Proxy {
     /// runs. `None` if the child couldn't be assigned (falls back to the
     /// snapshot-based kill in `Drop`).
     _job: Option<job::KillOnDropJob>,
+    /// Diagnostic progress counters shared by the reader producer/consumer and
+    /// the optional watchdog thread. See [`PtyProgress`].
+    progress: Arc<PtyProgress>,
 }
 
 impl Proxy {
@@ -183,6 +211,7 @@ impl Proxy {
             last_tail: Arc::new(RwLock::new(None)),
             launch_failed: Arc::new(AtomicBool::new(false)),
             _job: job,
+            progress: Arc::new(PtyProgress::default()),
         })
     }
 
@@ -210,6 +239,7 @@ impl Proxy {
         self.spawn_stdin_thread();
         self.spawn_inject_thread(inject_server);
         self.spawn_resize_watcher();
+        self.spawn_watchdog();
 
         // Wait for the child to exit. This blocks for the entire session —
         // deliberately without a timeout (see wait_child_blocking) — and never
@@ -422,6 +452,74 @@ impl Proxy {
         });
     }
 
+    /// Diagnostic watchdog: logs the four reader-pipeline progress counters once
+    /// per second so an intermittent hang can be pinpointed post-mortem from
+    /// `hcom.log`. Enabled only when `HCOM_PTY_WATCHDOG=1`; otherwise not spawned.
+    ///
+    /// Each tick logs absolute counts plus the per-tick delta, and classifies a
+    /// stall: if `chunks_recv` advanced but `bytes_written` did not, the consumer
+    /// is wedged on the stdout write (the #1 suspect); if `bytes_read` advanced
+    /// but `chunks_sent` did not, the producer is blocked on a full channel
+    /// (consumer lagging); if `chunks_sent` advanced but `chunks_recv` did not,
+    /// the consumer is starved. All-quiet is reported as `idle` (benign).
+    fn spawn_watchdog(&self) {
+        if std::env::var("HCOM_PTY_WATCHDOG").as_deref() != Ok("1") {
+            return;
+        }
+        let running = self.running.clone();
+        let progress = self.progress.clone();
+        crate::log::log_info(
+            "pty",
+            "watchdog.start",
+            "HCOM_PTY_WATCHDOG=1: reader-pipeline progress watchdog active (1s cadence)",
+        );
+        thread::spawn(move || {
+            let (mut p_read, mut p_sent, mut p_recv, mut p_written) = (0u64, 0u64, 0u64, 0u64);
+            while running.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_secs(1));
+                let read = progress.bytes_read.load(Ordering::Relaxed);
+                let sent = progress.chunks_sent.load(Ordering::Relaxed);
+                let recv = progress.chunks_recv.load(Ordering::Relaxed);
+                let written = progress.bytes_written.load(Ordering::Relaxed);
+
+                let (d_read, d_sent, d_recv, d_written) = (
+                    read.wrapping_sub(p_read),
+                    sent.wrapping_sub(p_sent),
+                    recv.wrapping_sub(p_recv),
+                    written.wrapping_sub(p_written),
+                );
+
+                // Classify the current tick. Order matters: a full channel
+                // (read advanced, send didn't) and a wedged stdout (recv
+                // advanced, write didn't) are the two hang signatures.
+                let stall = if d_recv > 0 && d_written == 0 {
+                    "STALL:consumer_stdout_write (recv advanced, bytes_written frozen)"
+                } else if d_read > 0 && d_sent == 0 {
+                    "STALL:producer_channel_full (bytes_read advanced, chunks_sent frozen)"
+                } else if d_sent > 0 && d_recv == 0 {
+                    "STALL:consumer_starved (chunks_sent advanced, chunks_recv frozen)"
+                } else if d_read == 0 && d_sent == 0 && d_recv == 0 && d_written == 0 {
+                    "idle"
+                } else {
+                    "flowing"
+                };
+
+                crate::log::log_info(
+                    "pty",
+                    "watchdog.tick",
+                    &format!(
+                        "{stall} | read={read}(+{d_read}) sent={sent}(+{d_sent}) \
+                         recv={recv}(+{d_recv}) written={written}(+{d_written}) \
+                         channel_backlog={}",
+                        sent.saturating_sub(recv)
+                    ),
+                );
+
+                (p_read, p_sent, p_recv, p_written) = (read, sent, recv, written);
+            }
+        });
+    }
+
     /// PTY output → our stdout, feeding the screen tracker and the shared
     /// screen state the delivery loop reads. portable-pty's reader blocks, so a
     /// dedicated thread replaces the Unix poll loop.
@@ -465,6 +563,8 @@ impl Proxy {
         let ready_signaled = self.ready_signaled.clone();
         let screen_snapshot = self.screen_snapshot.clone();
         let writer = self.writer.clone();
+        let progress = self.progress.clone();
+        let progress_consumer = self.progress.clone();
         let (rows, cols) = (self.rows, self.cols);
 
         // Producer: owns the ConPTY reader and blocks in read(), forwarding raw
@@ -491,9 +591,19 @@ impl Proxy {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: child exited / PTY closed
                     Ok(n) => {
+                        // Instrumentation: count bytes drained from the ConPTY.
+                        // Stops advancing while the producer is blocked in read()
+                        // (idle child, benign) — distinguishes that from a send stall.
+                        progress
+                            .bytes_read
+                            .fetch_add(n as u64, Ordering::Relaxed);
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break; // consumer gone
                         }
+                        // Only reached once tx.send returned: if the channel is
+                        // full (consumer lagging) the line above blocks and this
+                        // counter freezes while bytes_read has already advanced.
+                        progress.chunks_sent.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => break,
                 }
@@ -558,6 +668,12 @@ impl Proxy {
                         break; // child exited / PTY closed
                     }
                     Ok(data) => {
+                        // Instrumentation: a chunk was pulled off the channel.
+                        // Advances whenever the consumer is scheduled and draining;
+                        // freezes while chunks_sent still climbs → consumer starved.
+                        progress_consumer
+                            .chunks_recv
+                            .fetch_add(1, Ordering::Relaxed);
                         let data = data.as_slice();
                         // A genuine keystroke / injected answer flagged a pending
                         // approval for clearing; the reader owns the tracker.
@@ -580,6 +696,14 @@ impl Proxy {
                         filter.filter(data, &mut scratch);
                         let _ = stdout.write_all(&scratch);
                         let _ = stdout.flush();
+                        // Instrumentation: bytes flushed to the outer console.
+                        // If the console write blocks (QuickEdit/mark pause, or a
+                        // full conhost render pipe), this freezes while chunks_recv
+                        // has already advanced — the prime hang signature. Counts
+                        // post-filter bytes actually handed to stdout.
+                        progress_consumer
+                            .bytes_written
+                            .fetch_add(scratch.len() as u64, Ordering::Relaxed);
 
                         // Headless: no outer terminal saw the DSR query, so answer
                         // it here (a canned cursor-at-1;1 report) to unblock the
